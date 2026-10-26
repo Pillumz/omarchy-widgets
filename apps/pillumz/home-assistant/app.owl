@@ -16,11 +16,11 @@ app "home assistant" {
 
   // Install the embedded standard-library helper. The guided setup never puts the token in a command.
   source ready = cmd("""d="$HOME/.local/share/omalauncher-home-assistant"
-if [ ! -s "$d/ha.py" ] || ! grep -q '^# owl-ha-helper 2$' "$d/ha.py"; then
+if [ ! -s "$d/ha.py" ] || ! grep -q '^# owl-ha-helper 4$' "$d/ha.py"; then
   mkdir -p "$d"
   cat > "$d/ha.py.tmp" <<'PY_HELPER'
 #!/usr/bin/env python3
-# owl-ha-helper 2
+# owl-ha-helper 4
 # Home Assistant helper for the Omalauncher app. Python standard library only.
 import getpass
 import json
@@ -192,7 +192,9 @@ def snapshot(refresh_areas=False):
                 continue
             item = simplify(entity, by_entity.get(eid, ""))
             if domain == "todo":
-                todos.append({k: item[k] for k in ("id", "name", "state")})
+                features = item["features"]
+                todos.append({**{k: item[k] for k in ("id", "name", "state", "features")},
+                              "canDue": bool(features & 48), "canDateTime": bool(features & 32), "canDescription": bool(features & 64)})
             else:
                 entities.append(item)
         used_areas = {e["area"] for e in entities if e["area"]}
@@ -200,7 +202,7 @@ def snapshot(refresh_areas=False):
                     for a in areas if a.get("id", "") in used_areas]
         if any(not e["area"] for e in entities):
             area_out.append({"id": "", "name": "Other"})
-        out = {"configured": True, "ok": True, "base": base, "at": int(time.time()),
+        out = {"configured": True, "ok": True, "base": base,
                "areas": area_out, "entities": entities, "todos": todos, "discoveryWarning": discovery_warning}
         atomic_json(SNAPSHOT_CACHE, out)
         emit(out)
@@ -221,7 +223,8 @@ def service(domain, name, entity_id, extra=None):
 
 
 def action_result(ok=True, **values):
-    emit({"ok": ok, **values})
+    # OWL triggers watch for changes; identical mutations must still produce a new result.
+    emit({"ok": ok, "at": time.time_ns(), **values})
 
 
 def do_service(domain, name, entity_id, extra):
@@ -253,6 +256,12 @@ def room_off(area):
         action_result(False, id=area, error=str(e))
 
 
+def todo_features(ha, entity_id):
+    states = ha.request("/api/states")
+    entity = next((e for e in states if e.get("entity_id") == entity_id), {})
+    return int((entity.get("attributes") or {}).get("supported_features") or 0)
+
+
 def todo_items(entity_id):
     try:
         if not entity_id:
@@ -263,6 +272,8 @@ def todo_items(entity_id):
                 return
         raw = HA().request("/api/services/todo/get_items?return_response",
                            {"entity_id": entity_id, "status": ["needs_action", "completed"]})
+        if isinstance(raw, dict):
+            raw = raw.get("service_response", raw)
         items = []
         if isinstance(raw, dict):
             value = raw.get(entity_id, raw)
@@ -300,9 +311,24 @@ def todo_action(operation, entity_id, args):
             service("todo", "add_item", entity_id, extra)
         elif operation == "update":
             uid, summary, status, due, description = args
-            extra = {"item": uid, "rename": summary, "status": status,
-                     "due_date": due if due else None, "description": description}
-            service("todo", "update_item", entity_id, extra)
+            ha = HA()
+            features = todo_features(ha, entity_id)
+            extra = {"item": uid, "rename": summary, "status": status}
+            if due:
+                if "T" in due and features & 32:
+                    extra["due_datetime"] = due
+                elif features & 16:
+                    extra["due_date"] = due
+                elif features & 32:
+                    extra["due_datetime"] = due
+            else:
+                if features & 16:
+                    extra["due_date"] = None
+                if features & 32:
+                    extra["due_datetime"] = None
+            if features & 64:
+                extra["description"] = description
+            ha.request("/api/services/todo/update_item", {"entity_id": entity_id, **extra})
         elif operation == "status":
             uid, summary, status = args
             service("todo", "update_item", entity_id, {"item": uid, "rename": summary, "status": status})
@@ -353,6 +379,8 @@ def setup():
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
+    AREA_CACHE.unlink(missing_ok=True)
+    SNAPSHOT_CACHE.unlink(missing_ok=True)
     print("\nConnected successfully. Configuration saved with mode 0600.")
     print("Close this terminal and return to the app; discovery will begin automatically.")
     return 0
@@ -409,7 +437,7 @@ PY_HELPER
 fi
 printf ready""") every 1h
 
-  source ha = cmd("for i in 1 2 3 4 5 6 7 8 9 10; do [ -x ~/.local/share/omalauncher-home-assistant/ha.py ] && break; sleep 1; done; python ~/.local/share/omalauncher-home-assistant/ha.py snapshot") every 5s json status timeout 25s
+  source ha = cmd("python ~/.local/share/omalauncher-home-assistant/ha.py snapshot") every 5s json status timeout 30s
   source now = clock every 1s
 
   state savedData = null persist
@@ -440,6 +468,7 @@ printf ready""") every 1h
   let online = data != null && data.ok == true
   let entities = (data.entities ?? []).filter(e => e.domain != "todo")
   let todos = data.todos ?? []
+  let currentList = find(todos, t => t.id == todoList)
   let baseAreas = data.areas ?? []
   let currentArea = openArea == null ? null : find(baseAreas, a => a.id == openArea)
   let favoriteEntities = favorites.map(id => find(entities, e => e.id == id)).filter(e => e != null && !contains(hidden, e.id))
@@ -450,7 +479,7 @@ printf ready""") every 1h
   let reply = result == "" ? null : parseJson(result)
 
   on ha first {
-    savedData = ha.ok && ha.out.ok ? ha.out : savedData
+    savedData = ha.ok && ha.out.ok && ha.out != savedData ? ha.out : savedData
     todoList = len(ha.out.todos ?? []) > 0 && !any(ha.out.todos, t => t.id == todoList) ? ha.out.todos[0].id : todoList
   }
   on result {
@@ -709,7 +738,7 @@ printf ready""") every 1h
 
   component HomePage() {
     Column {
-      scroll: true
+      lazy: true
       weight: 1
       gap: 12
       padding: [12, 0, 12, 12]
@@ -741,7 +770,7 @@ printf ready""") every 1h
 
   component RoomPage() {
     Column {
-      scroll: true
+      lazy: true
       weight: 1
       gap: 12
       padding: [12, 0, 12, 12]
@@ -881,15 +910,19 @@ printf ready""") every 1h
           Text { text: "task"; style: label; color: muted }
           Input { text: todoName; placeholder: "task"; onChange: todoName = value }
         }
-        Column {
-          gap: 5
-          Text { text: "due date · YYYY-MM-DD"; style: label; color: muted }
-          Input { text: todoDue; placeholder: "optional"; onChange: todoDue = value }
+        if currentList != null && currentList.canDue {
+          Column {
+            gap: 5
+            Text { text: "due date or date-time"; style: label; color: muted }
+            Input { text: todoDue; placeholder: "optional"; onChange: todoDue = value }
+          }
         }
-        Column {
-          gap: 5
-          Text { text: "notes"; style: label; color: muted }
-          Input { text: todoDescription; placeholder: "optional"; onChange: todoDescription = value }
+        if currentList != null && currentList.canDescription {
+          Column {
+            gap: 5
+            Text { text: "notes"; style: label; color: muted }
+            Input { text: todoDescription; placeholder: "optional"; onChange: todoDescription = value }
+          }
         }
         if message != "" { Text { text: message; style: small; color: red; maxLines: 3 } }
         Row {
@@ -899,7 +932,7 @@ printf ready""") every 1h
             color: accent
             onTap: {
               if trim(todoName) == "" { message = "The task needs a name" }
-              else if trim(todoDue) != "" && match(trim(todoDue), '^\\d{4}-\\d{2}-\\d{2}$') == null { message = "Use YYYY-MM-DD for the due date, or leave it empty" }
+              else if currentList != null && currentList.canDue && !currentList.canDateTime && trim(todoDue) != "" && match(trim(todoDue), '^\\d{4}-\\d{2}-\\d{2}$') == null { message = "Use YYYY-MM-DD for the due date, or leave it empty" }
               else {
                 result = run("python ~/.local/share/omalauncher-home-assistant/ha.py todo update ${sh(todoList)} ${sh(editingTodo)} ${sh(trim(todoName))} ${sh(currentTodo.status)} ${sh(trim(todoDue))} ${sh(trim(todoDescription))}")
                 editingTodo = ""
@@ -1053,6 +1086,8 @@ printf ready""") every 1h
     gap: 0
     if ready != "ready" {
       Column { padding: 16; gap: 8; Text { text: "Preparing Home Assistant…"; color: muted } }
+    } else if ha == null {
+      Column { padding: 16; gap: 8; Text { text: "Connecting to Home Assistant…"; color: muted } }
     } else if !configured {
       Column {
         scroll: true

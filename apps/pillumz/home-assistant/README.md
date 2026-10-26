@@ -8,7 +8,7 @@ A native Omalauncher app for a Home Assistant server. It discovers areas and ent
 - Room detail views with lights, covers, and favorite read-only sensors.
 - Light toggling, room-wide lights-off, and brightness when supported.
 - Cover open/stop/close and position when supported.
-- Multiple to-do lists, quick-add, completion, editing, due dates, and deletion with confirmation.
+- Multiple to-do lists, quick-add, completion, editing, due dates, and deletion with confirmation. To-do item retrieval uses Home Assistant's service-response API and needs Home Assistant 2024.8 or newer; other dashboard controls do not have that minimum.
 - Persistent favorites, hidden entities, room order, selected list, and cached data for offline reads.
 - Clear pending, unavailable, offline, and error states.
 
