@@ -16,11 +16,11 @@ app "home assistant" {
 
   // Install the embedded standard-library helper. The guided setup never puts the token in a command.
   source ready = cmd("""d="$HOME/.local/share/omalauncher-home-assistant"
-if [ ! -s "$d/ha.py" ] || ! grep -q '^# owl-ha-helper 4$' "$d/ha.py"; then
+if [ ! -s "$d/ha.py" ] || ! grep -q '^# owl-ha-helper 5$' "$d/ha.py"; then
   mkdir -p "$d"
   cat > "$d/ha.py.tmp" <<'PY_HELPER'
 #!/usr/bin/env python3
-# owl-ha-helper 4
+# owl-ha-helper 5
 # Home Assistant helper for the Omalauncher app. Python standard library only.
 import getpass
 import json
@@ -324,7 +324,7 @@ def todo_action(operation, entity_id, args):
             else:
                 if features & 16:
                     extra["due_date"] = None
-                if features & 32:
+                elif features & 32:
                     extra["due_datetime"] = None
             if features & 64:
                 extra["description"] = description
@@ -381,6 +381,9 @@ def setup():
             os.unlink(tmp)
     AREA_CACHE.unlink(missing_ok=True)
     SNAPSHOT_CACHE.unlink(missing_ok=True)
+    if TODO_CACHE.exists():
+        for path in TODO_CACHE.glob("*.json"):
+            path.unlink()
     print("\nConnected successfully. Configuration saved with mode 0600.")
     print("Close this terminal and return to the app; discovery will begin automatically.")
     return 0
