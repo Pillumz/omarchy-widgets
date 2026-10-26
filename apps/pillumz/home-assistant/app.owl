@@ -1,0 +1,1092 @@
+app "home assistant" {
+  meta { owl: 11; description: "A native Home Assistant dashboard: discovered rooms, dimmable lights, covers, sensors, favorites, and to-do lists"; version: "1.0"; license: "MIT"; category: "home" }
+  title: !configured ? "home assistant" : editingTodo != "" ? "edit task" : view == "settings" ? "settings" : view == "customize" ? "customize" : openArea != null && currentArea != null ? currentArea.name : tab == "tasks" ? "tasks" : "home"
+  back: editingTodo != "" || view != "" || openArea != null
+  onBack: {
+    if editingTodo != "" { editingTodo = ""; confirmDelete = false }
+    else if openArea != null { openArea = null }
+    else { view = "" }
+  }
+  icon: """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M6 22 24 6l18 16"/>
+    <path d="M11 19v23h26V19M19 42V29h10v13"/>
+    <path d="M17 20h14"/>
+  </svg>"""
+  requires { pacman: ["python"] }
+
+  // Install the embedded standard-library helper. The guided setup never puts the token in a command.
+  source ready = cmd("""d="$HOME/.local/share/omalauncher-home-assistant"
+if [ ! -s "$d/ha.py" ] || ! grep -q '^# owl-ha-helper 2$' "$d/ha.py"; then
+  mkdir -p "$d"
+  cat > "$d/ha.py.tmp" <<'PY_HELPER'
+#!/usr/bin/env python3
+# owl-ha-helper 2
+# Home Assistant helper for the Omalauncher app. Python standard library only.
+import getpass
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+CONFIG = Path.home() / ".config" / "omarchy-proot" / "home-assistant"
+CACHE = Path.home() / ".cache" / "omalauncher-home-assistant"
+AREA_CACHE = CACHE / "areas.json"
+SNAPSHOT_CACHE = CACHE / "snapshot.json"
+TODO_CACHE = CACHE / "todo"
+SUPPORTED = {"light", "cover", "sensor", "todo"}
+
+
+def atomic_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(value, f, ensure_ascii=False, separators=(",", ":"))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def read_json(path, default=None):
+    try:
+        with path.open() as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def emit(value):
+    print(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+
+
+def config():
+    try:
+        lines = CONFIG.read_text().splitlines()
+        base, token = lines[0].strip().rstrip("/"), lines[1].strip()
+        if not base or not token or token == "PASTE-A-LONG-LIVED-TOKEN":
+            return None, None
+        return base, token
+    except (OSError, IndexError):
+        return None, None
+
+
+def valid_base(base):
+    try:
+        u = urllib.parse.urlsplit(base)
+        return u.scheme in {"http", "https"} and bool(u.netloc) and not u.username and not u.query and not u.fragment
+    except ValueError:
+        return False
+
+
+class HA:
+    def __init__(self):
+        self.base, self.token = config()
+        if not self.base:
+            raise RuntimeError("not configured")
+
+    def request(self, path, payload=None, timeout=12):
+        url = self.base + path
+        data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode()
+        req = urllib.request.Request(url, data=data, headers={
+            "Authorization": "Bearer " + self.token,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }, method="GET" if data is None else "POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                raw = response.read(4 * 1024 * 1024 + 1)
+                if len(raw) > 4 * 1024 * 1024:
+                    raise RuntimeError("Home Assistant response is too large")
+                text = raw.decode("utf-8", "replace")
+                try:
+                    return json.loads(text)
+                except ValueError:
+                    return text
+        except urllib.error.HTTPError as e:
+            detail = e.read(1024).decode("utf-8", "replace").strip()
+            raise RuntimeError(f"Home Assistant returned HTTP {e.code}" + (f": {detail}" if detail else "")) from None
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"cannot reach Home Assistant: {e.reason}") from None
+        except TimeoutError:
+            raise RuntimeError("Home Assistant request timed out") from None
+
+
+def area_map(ha, refresh=False):
+    if not refresh:
+        cached = read_json(AREA_CACHE)
+        if cached and time.time() - cached.get("at", 0) < 6 * 3600:
+            return cached.get("areas", [])
+    template = (
+        "{% set ns = namespace(rows=[]) %}\n"
+        "{% for a in areas() %}\n"
+        "{% set ns.rows = ns.rows + [{\"id\": a, \"name\": area_name(a), \"entities\": area_entities(a)}] %}\n"
+        "{% endfor %}\n"
+        "{{ {\"areas\": ns.rows} | to_json }}"
+    )
+    raw = ha.request("/api/template", {"template": template})
+    if isinstance(raw, str):
+        raw = json.loads(raw)
+    areas = raw.get("areas", []) if isinstance(raw, dict) else []
+    atomic_json(AREA_CACHE, {"at": int(time.time()), "areas": areas})
+    return areas
+
+
+def simplify(entity, area):
+    eid = entity.get("entity_id", "")
+    domain = eid.split(".", 1)[0]
+    a = entity.get("attributes") or {}
+    features = int(a.get("supported_features") or 0)
+    modes = a.get("supported_color_modes") or []
+    brightness = a.get("brightness")
+    item = {
+        "id": eid,
+        "name": a.get("friendly_name") or eid.split(".", 1)[-1].replace("_", " "),
+        "domain": domain,
+        "state": entity.get("state", "unknown"),
+        "area": area,
+        "unit": a.get("unit_of_measurement") or "",
+        "deviceClass": a.get("device_class") or "",
+        "features": features,
+        "dimmable": domain == "light" and (brightness is not None or features & 1 or any(m != "onoff" for m in modes)),
+        "brightness": None if brightness is None else round(100 * float(brightness) / 255),
+        "position": a.get("current_position"),
+        "canPosition": domain == "cover" and bool(features & 4 or a.get("current_position") is not None),
+        "canStop": domain == "cover" and bool(features & 8),
+    }
+    return item
+
+
+def snapshot(refresh_areas=False):
+    base, _ = config()
+    if not base:
+        emit({"configured": False, "ok": False, "areas": [], "entities": [], "todos": [], "error": "not configured"})
+        return
+    try:
+        ha = HA()
+        discovery_warning = False
+        try:
+            areas = area_map(ha, refresh_areas)
+        except Exception:
+            areas = []
+            discovery_warning = True
+        states = ha.request("/api/states")
+        by_entity = {}
+        names = {}
+        for area in areas:
+            names[area.get("id", "")] = area.get("name") or area.get("id", "")
+            for eid in area.get("entities", []):
+                by_entity[eid] = area.get("id", "")
+        entities = []
+        todos = []
+        for entity in states:
+            eid = entity.get("entity_id", "")
+            domain = eid.split(".", 1)[0]
+            if domain not in SUPPORTED:
+                continue
+            item = simplify(entity, by_entity.get(eid, ""))
+            if domain == "todo":
+                todos.append({k: item[k] for k in ("id", "name", "state")})
+            else:
+                entities.append(item)
+        used_areas = {e["area"] for e in entities if e["area"]}
+        area_out = [{"id": a.get("id", ""), "name": names.get(a.get("id", ""), a.get("name", ""))}
+                    for a in areas if a.get("id", "") in used_areas]
+        if any(not e["area"] for e in entities):
+            area_out.append({"id": "", "name": "Other"})
+        out = {"configured": True, "ok": True, "base": base, "at": int(time.time()),
+               "areas": area_out, "entities": entities, "todos": todos, "discoveryWarning": discovery_warning}
+        atomic_json(SNAPSHOT_CACHE, out)
+        emit(out)
+    except Exception as e:
+        cached = read_json(SNAPSHOT_CACHE, {})
+        cached.update({"configured": True, "ok": False, "base": base, "cached": True,
+                       "error": str(e), "areas": cached.get("areas", []),
+                       "entities": cached.get("entities", []), "todos": cached.get("todos", [])})
+        emit(cached)
+
+
+def service(domain, name, entity_id, extra=None):
+    body = {"entity_id": entity_id}
+    if extra:
+        body.update(extra)
+    result = HA().request(f"/api/services/{domain}/{name}", body)
+    return result
+
+
+def action_result(ok=True, **values):
+    emit({"ok": ok, **values})
+
+
+def do_service(domain, name, entity_id, extra):
+    try:
+        service(domain, name, entity_id, extra)
+        action_result(id=entity_id)
+    except Exception as e:
+        action_result(False, id=entity_id, error=str(e))
+
+
+def room_off(area):
+    try:
+        ha = HA()
+        areas = area_map(ha)
+        ids = set()
+        assigned = set()
+        for a in areas:
+            members = set(a.get("entities", []))
+            assigned.update(members)
+            if a.get("id", "") == area:
+                ids.update(members)
+        states = ha.request("/api/states")
+        lights = [e["entity_id"] for e in states if e.get("entity_id", "").startswith("light.")
+                  and e.get("state") == "on" and ((e["entity_id"] in ids) if area else (e["entity_id"] not in assigned))]
+        if lights:
+            service("light", "turn_off", lights)
+        action_result(id=area, count=len(lights))
+    except Exception as e:
+        action_result(False, id=area, error=str(e))
+
+
+def todo_items(entity_id):
+    try:
+        if not entity_id:
+            states = HA().request("/api/states")
+            entity_id = next((e.get("entity_id", "") for e in states if e.get("entity_id", "").startswith("todo.")), "")
+            if not entity_id:
+                emit({"ok": True, "id": "", "items": []})
+                return
+        raw = HA().request("/api/services/todo/get_items?return_response",
+                           {"entity_id": entity_id, "status": ["needs_action", "completed"]})
+        items = []
+        if isinstance(raw, dict):
+            value = raw.get(entity_id, raw)
+            if isinstance(value, dict):
+                items = value.get("items", [])
+        elif isinstance(raw, list):
+            for value in raw:
+                if isinstance(value, dict) and isinstance(value.get("items"), list):
+                    items = value["items"]
+                    break
+        normalized = [{"uid": str(i.get("uid") or i.get("summary") or ""),
+                       "summary": i.get("summary") or "",
+                       "status": i.get("status") or "needs_action",
+                       "due": i.get("due") or "",
+                       "description": i.get("description") or ""} for i in items]
+        out = {"ok": True, "id": entity_id, "items": normalized}
+        atomic_json(TODO_CACHE / (urllib.parse.quote(entity_id, safe="") + ".json"), out)
+        emit(out)
+    except Exception as e:
+        cached = read_json(TODO_CACHE / (urllib.parse.quote(entity_id, safe="") + ".json"), {})
+        cached.update({"ok": False, "id": entity_id, "cached": True, "error": str(e),
+                       "items": cached.get("items", [])})
+        emit(cached)
+
+
+def todo_action(operation, entity_id, args):
+    try:
+        if operation == "add":
+            summary, due, description = args
+            extra = {"item": summary}
+            if due:
+                extra["due_date"] = due
+            if description:
+                extra["description"] = description
+            service("todo", "add_item", entity_id, extra)
+        elif operation == "update":
+            uid, summary, status, due, description = args
+            extra = {"item": uid, "rename": summary, "status": status,
+                     "due_date": due if due else None, "description": description}
+            service("todo", "update_item", entity_id, extra)
+        elif operation == "status":
+            uid, summary, status = args
+            service("todo", "update_item", entity_id, {"item": uid, "rename": summary, "status": status})
+        elif operation == "remove":
+            service("todo", "remove_item", entity_id, {"item": args[0]})
+        else:
+            raise RuntimeError("unknown to-do operation")
+        action_result(id=entity_id)
+    except Exception as e:
+        action_result(False, id=entity_id, error=str(e))
+
+
+def setup():
+    old_base, _ = config()
+    print("Home Assistant setup\n")
+    print("Enter the server address, then paste a long-lived access token.")
+    print("Home Assistant: your profile > Security > Long-lived access tokens.\n")
+    base = input(f"Server URL [{old_base or 'http://homeassistant.local:8123'}]: ").strip()
+    base = (base or old_base or "http://homeassistant.local:8123").rstrip("/")
+    if not valid_base(base):
+        print("Use an http:// or https:// server URL without credentials, query, or fragment.")
+        return 1
+    if base.startswith("http://"):
+        print("Warning: HTTP does not encrypt the token or traffic in transit. HTTPS is recommended.")
+    token = getpass.getpass("Long-lived access token (hidden): ").strip()
+    if not token:
+        print("Setup cancelled; the previous configuration is unchanged.")
+        return 1
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    previous = CONFIG.read_bytes() if CONFIG.exists() else None
+    trailing = CONFIG.read_text().splitlines()[2:] if CONFIG.exists() else []
+    fd, tmp = tempfile.mkstemp(prefix="home-assistant.", dir=CONFIG.parent, text=True)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write("\n".join([base, token] + trailing) + "\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, CONFIG)
+        HA().request("/api/", timeout=10)
+    except Exception as e:
+        if previous is None:
+            CONFIG.unlink(missing_ok=True)
+        else:
+            CONFIG.write_bytes(previous)
+            CONFIG.chmod(0o600)
+        print(f"Connection test failed: {e}")
+        print("The previous configuration is unchanged. Run setup to try again.")
+        return 1
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    print("\nConnected successfully. Configuration saved with mode 0600.")
+    print("Close this terminal and return to the app; discovery will begin automatically.")
+    return 0
+
+
+def disconnect():
+    try:
+        CONFIG.unlink(missing_ok=True)
+        for path in (AREA_CACHE, SNAPSHOT_CACHE):
+            path.unlink(missing_ok=True)
+        if TODO_CACHE.exists():
+            for path in TODO_CACHE.glob("*.json"):
+                path.unlink()
+        action_result()
+    except Exception as e:
+        action_result(False, error=str(e))
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("usage: ha.py setup|snapshot|rediscover|call|room-off|todo|disconnect", file=sys.stderr)
+        return 2
+    command = sys.argv[1]
+    if command == "setup":
+        return setup()
+    if command == "snapshot":
+        snapshot()
+    elif command == "rediscover":
+        snapshot(True)
+    elif command == "disconnect":
+        disconnect()
+    elif command == "call" and len(sys.argv) >= 5:
+        extra = json.loads(sys.argv[5]) if len(sys.argv) > 5 else None
+        do_service(sys.argv[2], sys.argv[3], sys.argv[4], extra)
+    elif command == "room-off" and len(sys.argv) == 3:
+        room_off(sys.argv[2])
+    elif command == "todo" and len(sys.argv) >= 4:
+        operation = sys.argv[2]
+        if operation == "items":
+            todo_items(sys.argv[3])
+        else:
+            todo_action(operation, sys.argv[3], sys.argv[4:])
+    else:
+        print("invalid arguments", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PY_HELPER
+  chmod 700 "$d/ha.py.tmp"
+  mv "$d/ha.py.tmp" "$d/ha.py"
+fi
+printf ready""") every 1h
+
+  source ha = cmd("for i in 1 2 3 4 5 6 7 8 9 10; do [ -x ~/.local/share/omalauncher-home-assistant/ha.py ] && break; sleep 1; done; python ~/.local/share/omalauncher-home-assistant/ha.py snapshot") every 5s json status timeout 25s
+  source now = clock every 1s
+
+  state savedData = null persist
+  state tab = "home" persist
+  state openArea = null
+  state view = ""
+  state favorites = [] persist
+  state hidden = [] persist
+  state roomOrder = [] persist
+  state expanded = []
+  state pending = []
+  state result = ""
+  state message = ""
+  state confirmDisconnect = false
+
+  state todoList = "" persist
+  state savedTodoList = "" persist
+  state savedTodoItems = [] persist
+  state showCompleted = false
+  state editingTodo = ""
+  state todoName = ""
+  state todoDue = ""
+  state todoDescription = ""
+  state confirmDelete = false
+
+  let data = ha != null && ha.ok ? ha.out : savedData
+  let configured = data != null && data.configured == true
+  let online = data != null && data.ok == true
+  let entities = (data.entities ?? []).filter(e => e.domain != "todo")
+  let todos = data.todos ?? []
+  let baseAreas = data.areas ?? []
+  let currentArea = openArea == null ? null : find(baseAreas, a => a.id == openArea)
+  let favoriteEntities = favorites.map(id => find(entities, e => e.id == id)).filter(e => e != null && !contains(hidden, e.id))
+  let areas = (roomOrder.map(id => find(baseAreas, a => a.id == id)).filter(a => a != null) + baseAreas.filter(a => !contains(roomOrder, a.id)))
+    .filter(a => any(entities, e => e.area == a.id && !contains(hidden, e.id)))
+  let roomEntities = openArea == null ? [] : entities.filter(e => e.area == openArea && !contains(hidden, e.id) && (e.domain != "sensor" || contains(favorites, e.id)))
+  let roomLightsOn = count(roomEntities, e => e.domain == "light" && e.state == "on")
+  let reply = result == "" ? null : parseJson(result)
+
+  on ha first {
+    savedData = ha.ok && ha.out.ok ? ha.out : savedData
+    todoList = len(ha.out.todos ?? []) > 0 && !any(ha.out.todos, t => t.id == todoList) ? ha.out.todos[0].id : todoList
+  }
+  on result {
+    message = reply == null ? "The command failed; refresh before trying again" : reply.ok ? "" : reply.error
+    pending = reply == null ? pending : filter(pending, p => p.id != reply.id)
+  }
+  every 1s {
+    message = any(pending, p => now - p.started >= 20) ? "A command was not confirmed; refresh before trying again" : message
+    pending = now == null ? pending : filter(pending, p => now - p.started < 20)
+  }
+
+  source todoData = cmd(tab == "tasks" ? "python ~/.local/share/omalauncher-home-assistant/ha.py todo items ${sh(todoList)}" : "printf '{\"ok\":false,\"items\":[]}'") every 10s json status timeout 25s
+  on todoData first {
+    savedTodoItems = todoData.ok && todoData.out.ok && todoData.out.id == todoList ? todoData.out.items : savedTodoItems
+    savedTodoList = todoData.ok && todoData.out.ok && todoData.out.id == todoList ? todoList : savedTodoList
+  }
+  let todoItems = todoData != null && todoData.ok && todoData.out.id == todoList ? todoData.out.items : savedTodoList == todoList ? savedTodoItems : []
+  let currentTodo = editingTodo == "" ? null : find(todoItems, i => i.uid == editingTodo)
+  let activeTodos = todoItems.filter(i => i.status != "completed")
+  let completedTodos = todoItems.filter(i => i.status == "completed")
+
+  component Tab(name, label) {
+    Column {
+      weight: 1
+      align: center
+      gap: 4
+      padding: [0, 7]
+      onTap: { tab = name; openArea = null; view = ""; editingTodo = ""; message = ""; haptic() }
+      Box {
+        align: center
+        width: 64
+        height: 32
+        radius: 8 * corners
+        background: tab == name ? alpha(foreground, 0.08) : null
+        Text { text: name == "home" ? "⌂" : "✓"; fontSize: 23; color: tab == name ? foreground : muted; align: center }
+      }
+      Text { text: label; style: small; align: center; maxLines: 1; bold: tab == name; color: tab == name ? foreground : muted }
+    }
+  }
+
+  component Rule() {
+    Box { height: 1; fill: width; background: alpha(muted, 0.25) }
+  }
+
+  component Pin(id) {
+    Text {
+      text: contains(favorites, id) ? "★" : "☆"
+      fontSize: 22
+      color: contains(favorites, id) ? accent : alpha(foreground, 0.55)
+      width: 44
+      align: center
+      padding: [7, 0]
+      onTap: {
+        favorites = contains(favorites, id) ? filter(favorites, f => f != id) : favorites + [id]
+        haptic()
+      }
+    }
+  }
+
+  component Sensor(e) {
+    Row {
+      gap: 8
+      align: center
+      padding: [10, 6]
+      Column {
+        weight: 1
+        gap: 2
+        Text { text: e.name; maxLines: 1 }
+        Text { text: e.deviceClass == "" ? "sensor" : lower(e.deviceClass); style: small; color: muted; maxLines: 1 }
+      }
+      Text { text: "${e.state}${e.unit == "" ? "" : " " + e.unit}"; bold: true; maxLines: 1 }
+      Pin { id: e.id }
+    }
+  }
+
+  component Entity(e) {
+    let request = find(pending, p => p.id == e.id)
+    let current = request == null ? e.state : request.state
+    let brightness = request != null && request.brightness != null ? request.brightness : e.brightness
+    let position = request != null && request.position != null ? request.position : e.position
+    let unavailable = contains(["unavailable", "unknown", "unreachable"], current)
+    let isExpanded = contains(expanded, e.id)
+    Column {
+      gap: 8
+      padding: [10, 10]
+      radius: 8 * corners
+      background: e.domain == "light" && current == "on" ? alpha(accent, 0.10) : alpha(foreground, 0.045)
+      if e.domain == "sensor" {
+        Sensor { e: e }
+      } else {
+        Row {
+          gap: 8
+          align: center
+          Column {
+            weight: 1
+            gap: 3
+            onTap: {
+              if e.domain == "light" && !unavailable && request == null {
+                message = ""
+                result = run("python ~/.local/share/omalauncher-home-assistant/ha.py call light ${sh(current == "on" ? "turn_off" : "turn_on")} ${sh(e.id)}")
+                pending = pending + [{id: e.id, state: current == "on" ? "off" : "on", started: now}]
+                haptic()
+              } else if e.domain == "cover" {
+                expanded = isExpanded ? filter(expanded, id => id != e.id) : expanded + [e.id]
+              }
+            }
+            Text { text: e.name; maxLines: 1; color: unavailable ? muted : foreground }
+            Text {
+              text: request != null ? "setting…" : unavailable ? current : e.domain == "cover" ? "${current}${position == null ? "" : " · ${position}%"}": current == "on" && brightness != null ? "on · ${brightness}%" : current
+              style: small
+              color: unavailable ? red : current == "on" || current == "open" || current == "opening" ? accent : muted
+              maxLines: 1
+            }
+          }
+          Pin { id: e.id }
+          if (e.domain == "light" && e.dimmable) || e.domain == "cover" {
+            Text {
+              text: isExpanded ? "⌃" : "⌄"
+              fontSize: 20
+              color: alpha(foreground, 0.55)
+              width: 44
+              align: center
+              padding: [7, 0]
+              onTap: expanded = isExpanded ? filter(expanded, id => id != e.id) : expanded + [e.id]
+            }
+          }
+        }
+        if isExpanded && e.domain == "light" && e.dimmable {
+          Row {
+            gap: 10
+            align: center
+            Slider {
+              value: brightness ?? 0
+              min: 1
+              max: 100
+              step: 1
+              weight: 1
+              color: accent
+              onChange: {
+                if request == null {
+                  message = ""
+                  result = run("python ~/.local/share/omalauncher-home-assistant/ha.py call light turn_on ${sh(e.id)} ${sh("{\"brightness_pct\":" + int(value) + "}")}")
+                  pending = pending + [{id: e.id, state: "on", brightness: int(value), started: now}]
+                }
+              }
+            }
+            Text { text: "${brightness ?? 0}%"; style: small; width: 38; align: end }
+          }
+        }
+        if isExpanded && e.domain == "cover" {
+          Column {
+            gap: 10
+            Row {
+              gap: 8
+              Column {
+                weight: 1
+                padding: [8, 5]
+                align: center
+                radius: 5 * corners
+                background: alpha(foreground, 0.06)
+                onTap: {
+                  if !unavailable && request == null {
+                    result = run("python ~/.local/share/omalauncher-home-assistant/ha.py call cover open_cover ${sh(e.id)}")
+                    pending = pending + [{id: e.id, state: "opening", position: 100, started: now}]
+                    haptic()
+                  }
+                }
+                Text { text: "open"; align: center; color: accent }
+              }
+              if e.canStop {
+                Column {
+                  weight: 1
+                  padding: [8, 5]
+                  align: center
+                  radius: 5 * corners
+                  background: alpha(foreground, 0.06)
+                  onTap: {
+                    if !unavailable && request == null {
+                      result = run("python ~/.local/share/omalauncher-home-assistant/ha.py call cover stop_cover ${sh(e.id)}")
+                      pending = pending + [{id: e.id, state: current, started: now}]
+                      haptic()
+                    }
+                  }
+                  Text { text: "stop"; align: center }
+                }
+              }
+              Column {
+                weight: 1
+                padding: [8, 5]
+                align: center
+                radius: 5 * corners
+                background: alpha(foreground, 0.06)
+                onTap: {
+                  if !unavailable && request == null {
+                    result = run("python ~/.local/share/omalauncher-home-assistant/ha.py call cover close_cover ${sh(e.id)}")
+                    pending = pending + [{id: e.id, state: "closing", position: 0, started: now}]
+                    haptic()
+                  }
+                }
+                Text { text: "close"; align: center }
+              }
+            }
+            if e.canPosition {
+              Row {
+                gap: 10
+                align: center
+                Slider {
+                  value: position ?? 0
+                  min: 0
+                  max: 100
+                  step: 5
+                  weight: 1
+                  color: accent
+                  onChange: {
+                    if request == null {
+                      result = run("python ~/.local/share/omalauncher-home-assistant/ha.py call cover set_cover_position ${sh(e.id)} ${sh("{\"position\":" + int(value) + "}")}")
+                      pending = pending + [{id: e.id, state: int(value) == 0 ? "closed" : "open", position: int(value), started: now}]
+                    }
+                  }
+                }
+                Text { text: "${position ?? 0}%"; style: small; width: 38; align: end }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  component RoomRow(a) {
+    let members = entities.filter(e => e.area == a.id && !contains(hidden, e.id))
+    let lights = members.filter(e => e.domain == "light")
+    let on = count(lights, e => e.state == "on")
+    let covers = members.filter(e => e.domain == "cover")
+    let sensors = members.filter(e => e.domain == "sensor" && contains(favorites, e.id))
+    Column {
+      gap: 4
+      padding: [12, 10]
+      radius: 8 * corners
+      background: alpha(foreground, 0.045)
+      onTap: { openArea = a.id; message = ""; haptic() }
+      Row {
+        gap: 8
+        align: center
+        Text { text: a.name; style: title; weight: 1; maxLines: 1 }
+        Text { text: "›"; style: title; color: alpha(foreground, 0.55) }
+      }
+      Text {
+        text: "${on}/${len(lights)} lights on · ${len(covers)} ${len(covers) == 1 ? "cover" : "covers"}${len(sensors) == 0 ? "" : " · ${len(sensors)} ${len(sensors) == 1 ? "sensor" : "sensors"}"}"
+        style: small
+        color: muted
+        maxLines: 1
+      }
+    }
+  }
+
+  component HomePage() {
+    Column {
+      scroll: true
+      weight: 1
+      gap: 12
+      padding: [12, 0, 12, 12]
+      Row {
+        align: center
+        Text { text: online ? "connected" : "offline · cached · tap to retry"; style: small; color: online ? muted : yellow; weight: 1; onTap: refresh() }
+        Text { text: "settings"; style: small; color: accent; padding: [6, 0]; onTap: view = "settings" }
+      }
+      if data.discoveryWarning == true { Text { text: "Areas are unavailable; entities are grouped under Other."; style: small; color: yellow } }
+      if message != "" {
+        Text { text: message; style: small; color: red; maxLines: 3 }
+      }
+      if len(favoriteEntities) > 0 {
+        Text { text: "favorites"; style: label; color: accent }
+        for e in favoriteEntities key e.id { Entity { e: e } }
+        Rule { }
+      }
+      Row {
+        align: center
+        Text { text: "rooms"; style: label; color: muted; weight: 1 }
+        if len(favoriteEntities) == 0 { Text { text: "pin controls with ☆"; style: small; color: muted } }
+      }
+      for a in areas key a.id { RoomRow { a: a } }
+      if len(areas) == 0 {
+        Text { text: "No supported rooms were discovered. Check the connection or customization settings."; style: small; color: muted }
+      }
+    }
+  }
+
+  component RoomPage() {
+    Column {
+      scroll: true
+      weight: 1
+      gap: 12
+      padding: [12, 0, 12, 12]
+      if message != "" { Text { text: message; style: small; color: red; maxLines: 3 } }
+      Row {
+        align: center
+        Text { text: online ? "connected" : "offline · cached · tap to retry"; style: small; color: online ? muted : yellow; weight: 1; onTap: refresh() }
+        if roomLightsOn > 0 {
+          Text {
+            text: "all lights off"
+            style: small
+            color: accent
+            padding: [6, 0]
+            onTap: {
+              result = run("python ~/.local/share/omalauncher-home-assistant/ha.py room-off ${sh(openArea)}")
+              haptic()
+            }
+          }
+        }
+      }
+      for e in roomEntities key e.id { Entity { e: e } }
+      if len(roomEntities) == 0 { Text { text: "Everything in this room is hidden."; color: muted } }
+    }
+  }
+
+  component TodoRow(i) {
+    let done = i.status == "completed"
+    Row {
+      gap: 10
+      align: center
+      padding: [9, 4]
+      Text {
+        text: done ? "☑" : "☐"
+        fontSize: 21
+        color: done ? accent : muted
+        width: 30
+        onTap: {
+          result = run("python ~/.local/share/omalauncher-home-assistant/ha.py todo status ${sh(todoList)} ${sh(i.uid)} ${sh(i.summary)} ${sh(done ? "needs_action" : "completed")}")
+          haptic()
+        }
+      }
+      Column {
+        weight: 1
+        gap: 3
+        onTap: {
+          editingTodo = i.uid
+          todoName = i.summary
+          todoDue = i.due
+          todoDescription = i.description
+          confirmDelete = false
+        }
+        Text { text: i.summary; color: done ? muted : foreground; maxLines: 3 }
+        if i.due != "" { Text { text: "due ${i.due}"; style: small; color: !done && i.due < fmtTime(now, "yyyy-MM-dd") ? red : muted } }
+      }
+      Text { text: "›"; color: muted }
+    }
+  }
+
+  component TasksPage() {
+    Column {
+      weight: 1
+      gap: 0
+      Row {
+        gap: 8
+        padding: [10, 6, 10, 12]
+        align: center
+        visible: todoList != ""
+        Input {
+          placeholder: "add a task"
+          clear: true
+          weight: 1
+          onSubmit: {
+            if trim(value) != "" {
+              result = run("python ~/.local/share/omalauncher-home-assistant/ha.py todo add ${sh(todoList)} ${sh(trim(value))} \"\" \"\"")
+              haptic()
+            }
+          }
+        }
+      }
+      Rule { }
+      Column {
+        lazy: true
+        weight: 1
+        gap: 10
+        padding: [12, 0, 12, 12]
+        Flow {
+          gap: 6
+          for t in todos key t.id {
+            Text {
+              text: t.name
+              style: small
+              padding: [7, 5]
+              radius: 4 * corners
+              color: todoList == t.id ? foreground : muted
+              background: todoList == t.id ? alpha(foreground, 0.14) : null
+              border: 1
+              borderColor: todoList == t.id ? alpha(foreground, 0.6) : alpha(muted, 0.35)
+              onTap: { todoList = t.id; showCompleted = false; haptic() }
+            }
+          }
+        }
+        if message != "" { Text { text: message; style: small; color: red; maxLines: 3 } }
+        if todoData != null && todoData.ok && !todoData.out.ok && len(todoItems) > 0 {
+          Text { text: "offline · showing saved tasks"; style: small; color: yellow }
+        }
+        if len(todos) == 0 {
+          Text { text: "No to-do lists were discovered on this server."; color: muted }
+        } else if len(activeTodos) == 0 {
+          Text { text: "No active tasks. Add one above."; color: muted }
+        }
+        for i in activeTodos key i.uid { TodoRow { i: i } }
+        if len(completedTodos) > 0 {
+          Text {
+            text: showCompleted ? "completed ⌃" : "completed (${len(completedTodos)}) ⌄"
+            style: label
+            color: muted
+            padding: [10, 0, 4, 0]
+            onTap: showCompleted = !showCompleted
+          }
+          if showCompleted { for i in completedTodos key i.uid { TodoRow { i: i } } }
+        }
+      }
+    }
+  }
+
+  component EditTodoPage() {
+    Column {
+      scroll: true
+      weight: 1
+      gap: 14
+      padding: [16, 0, 16, 12]
+      if currentTodo == null {
+        Text { text: "This task is no longer available. Go back to refresh the list."; color: muted }
+      } else {
+        Column {
+          gap: 5
+          Text { text: "task"; style: label; color: muted }
+          Input { text: todoName; placeholder: "task"; onChange: todoName = value }
+        }
+        Column {
+          gap: 5
+          Text { text: "due date · YYYY-MM-DD"; style: label; color: muted }
+          Input { text: todoDue; placeholder: "optional"; onChange: todoDue = value }
+        }
+        Column {
+          gap: 5
+          Text { text: "notes"; style: label; color: muted }
+          Input { text: todoDescription; placeholder: "optional"; onChange: todoDescription = value }
+        }
+        if message != "" { Text { text: message; style: small; color: red; maxLines: 3 } }
+        Row {
+          gap: 12
+          Button {
+            text: "save"
+            color: accent
+            onTap: {
+              if trim(todoName) == "" { message = "The task needs a name" }
+              else if trim(todoDue) != "" && match(trim(todoDue), '^\\d{4}-\\d{2}-\\d{2}$') == null { message = "Use YYYY-MM-DD for the due date, or leave it empty" }
+              else {
+                result = run("python ~/.local/share/omalauncher-home-assistant/ha.py todo update ${sh(todoList)} ${sh(editingTodo)} ${sh(trim(todoName))} ${sh(currentTodo.status)} ${sh(trim(todoDue))} ${sh(trim(todoDescription))}")
+                editingTodo = ""
+                haptic()
+              }
+            }
+          }
+          Button { text: "cancel"; color: muted; onTap: editingTodo = "" }
+        }
+        Rule { }
+        if !confirmDelete {
+          Button { text: "delete task"; color: red; onTap: confirmDelete = true }
+        } else {
+          Text { text: "Delete this task permanently?"; bold: true }
+          Row {
+            gap: 12
+            Button {
+              text: "delete"
+              color: red
+              onTap: {
+                result = run("python ~/.local/share/omalauncher-home-assistant/ha.py todo remove ${sh(todoList)} ${sh(editingTodo)}")
+                editingTodo = ""
+                confirmDelete = false
+                haptic()
+              }
+            }
+            Button { text: "keep task"; color: muted; onTap: confirmDelete = false }
+          }
+        }
+      }
+    }
+  }
+
+  component SettingsPage() {
+    Column {
+      scroll: true
+      weight: 1
+      gap: 14
+      padding: [16, 0, 16, 12]
+      Text { text: "connection"; style: label; color: accent }
+      Text { text: online ? "Connected to Home Assistant" : "Home Assistant is not reachable"; bold: true }
+      Text { text: data.base ?? "not configured"; style: small; color: muted; maxLines: 2 }
+      if (data.base ?? "").startsWith("http://") {
+        Text { text: "HTTP does not encrypt the token or traffic in transit. Use HTTPS when possible."; style: small; color: yellow }
+      }
+      Row {
+        gap: 12
+        Button { text: "connection setup"; color: accent; onTap: terminal("python ~/.local/share/omalauncher-home-assistant/ha.py setup", "home assistant setup") }
+        Button {
+          text: "rediscover"
+          color: muted
+          onTap: result = run("python ~/.local/share/omalauncher-home-assistant/ha.py rediscover")
+        }
+      }
+      Rule { }
+      Text { text: "dashboard"; style: label; color: accent }
+      Text { text: "Pin favorites, reorder rooms and favorites, or hide entities you do not use."; style: small; color: muted }
+      Button { text: "favorites, rooms & hidden entities"; color: accent; onTap: view = "customize" }
+      Rule { }
+      Text { text: "data"; style: label; color: accent }
+      Text { text: "The URL and token stay in a mode-0600 file in the Linux environment. Discovery and display preferences stay on this phone. Cached data is shown offline."; style: small; color: muted }
+      if !confirmDisconnect {
+        Button { text: "disconnect"; color: red; onTap: confirmDisconnect = true }
+      } else {
+        Text { text: "Remove the saved URL, token, and cached data from this phone?"; style: small }
+        Row {
+          gap: 12
+          Button {
+            text: "disconnect"
+            color: red
+            onTap: {
+              result = run("python ~/.local/share/omalauncher-home-assistant/ha.py disconnect")
+              savedData = null
+              savedTodoItems = []
+              confirmDisconnect = false
+              view = ""
+              openArea = null
+            }
+          }
+          Button { text: "cancel"; color: muted; onTap: confirmDisconnect = false }
+        }
+      }
+    }
+  }
+
+  component CustomizePage() {
+    Column {
+      lazy: true
+      weight: 1
+      gap: 12
+      padding: [12, 0, 12, 12]
+      Text { text: "favorite order"; style: label; color: accent }
+      if len(favorites) == 0 { Text { text: "No favorites yet. Use ☆ on a control or sensor."; style: small; color: muted } }
+      for id, i in favorites key id {
+        let e = find(entities, x => x.id == id)
+        if e != null {
+          Row {
+            gap: 6
+            align: center
+            Text { text: e.name; weight: 1; maxLines: 1 }
+            Text { text: "↑"; width: 34; align: center; color: i == 0 ? muted : accent; onTap: if i > 0 { favorites = favorites.take(i - 1) + [favorites[i]] + [favorites[i - 1]] + favorites.drop(i + 1) } }
+            Text { text: "↓"; width: 34; align: center; color: i == len(favorites) - 1 ? muted : accent; onTap: if i < len(favorites) - 1 { favorites = favorites.take(i) + [favorites[i + 1]] + [favorites[i]] + favorites.drop(i + 2) } }
+            Text { text: "remove"; style: small; color: muted; onTap: favorites = filter(favorites, f => f != id) }
+          }
+        }
+      }
+      Rule { }
+      Text { text: "room order"; style: label; color: accent }
+      for a, i in areas key a.id {
+        Row {
+          gap: 6
+          align: center
+          Text { text: a.name; weight: 1; maxLines: 1 }
+          Text { text: "↑"; width: 34; align: center; color: i == 0 ? muted : accent; onTap: if i > 0 { roomOrder = areas.map(x => x.id).take(i - 1) + [areas[i].id] + [areas[i - 1].id] + areas.map(x => x.id).drop(i + 1) } }
+          Text { text: "↓"; width: 34; align: center; color: i == len(areas) - 1 ? muted : accent; onTap: if i < len(areas) - 1 { roomOrder = areas.map(x => x.id).take(i) + [areas[i + 1].id] + [areas[i].id] + areas.map(x => x.id).drop(i + 2) } }
+        }
+      }
+      Rule { }
+      Text { text: "visible entities"; style: label; color: accent }
+      Text { text: "Hide a whole entity. Hidden favorites return when you show them again."; style: small; color: muted }
+      for e in entities.filter(e => !contains(hidden, e.id)) key e.id {
+        Row {
+          gap: 8
+          align: center
+          Column {
+            weight: 1
+            Text { text: e.name; maxLines: 1 }
+            Text { text: e.id; style: small; color: muted; maxLines: 1 }
+          }
+          Text { text: "hide"; style: small; color: muted; padding: [6, 0]; onTap: hidden = hidden + [e.id] }
+        }
+      }
+      if len(hidden) > 0 {
+        Rule { }
+        Text { text: "hidden entities"; style: label; color: accent }
+        for id in hidden key id {
+          let e = find(entities, x => x.id == id)
+          Row {
+            gap: 8
+            align: center
+            Text { text: e == null ? id : e.name; weight: 1; maxLines: 1; color: muted }
+            Text { text: "show"; style: small; color: accent; padding: [6, 0]; onTap: hidden = filter(hidden, h => h != id) }
+          }
+        }
+      }
+    }
+  }
+
+  Column {
+    fill: true
+    gap: 0
+    if ready != "ready" {
+      Column { padding: 16; gap: 8; Text { text: "Preparing Home Assistant…"; color: muted } }
+    } else if !configured {
+      Column {
+        scroll: true
+        weight: 1
+        gap: 16
+        padding: [24, 0, 24, 12]
+        Text { text: "your home, native"; style: title }
+        Text { text: "Connect Home Assistant to discover rooms, lights, curtains, sensors, and to-do lists automatically."; color: muted }
+        Column {
+          gap: 8
+          padding: [14, 12]
+          radius: 8 * corners
+          background: alpha(foreground, 0.05)
+          Text { text: "Guided setup"; bold: true }
+          Text { text: "Enter your server URL, paste a long-lived token into a hidden prompt, and test the connection. No configuration-file editing."; style: small; color: muted }
+          Text { text: "HTTPS is recommended. Local HTTP is supported with a warning."; style: small; color: muted }
+        }
+        Button { text: "connect Home Assistant"; color: accent; onTap: terminal("python ~/.local/share/omalauncher-home-assistant/ha.py setup", "home assistant setup") }
+      }
+    } else {
+      if view == "settings" { SettingsPage { } }
+      else if view == "customize" { CustomizePage { } }
+      else if editingTodo != "" { EditTodoPage { } }
+      else if openArea != null { RoomPage { } }
+      else if tab == "tasks" { TasksPage { } }
+      else { HomePage { } }
+      if view == "" && openArea == null && editingTodo == "" {
+        Rule { }
+        Row {
+          gap: 0
+          Tab { name: "home"; label: "home" }
+          Tab { name: "tasks"; label: "tasks" }
+        }
+      }
+    }
+  }
+}
